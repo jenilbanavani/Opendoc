@@ -234,3 +234,20 @@ Always review outputs critically.
 OpenDoc explores a simple idea:
 
 > What if coding sessions could become understandable knowledge instead of forgotten chaos?
+
+## Future Vision
+
+OpenDoc is currently focused on turning repositories into structured engineering insight, but the longer-term vision goes further than static documentation.
+
+Future implementations may include:
+
+* development memory and coding session timelines
+* version-aware engineering notes
+* AI-generated evolution tracking of projects over time
+* architecture change summaries between commits
+* learning progression analysis
+* repo “understanding history”
+* session-based developer notes inside VS Code
+
+The goal is not just to document code, but to help developers understand how their projects evolve over time — especially in increasingly AI-assisted and fast-moving workflows.
+
