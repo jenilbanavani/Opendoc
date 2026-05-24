@@ -1,0 +1,80 @@
+{
+  "name": "opendoc",
+  "displayName": "OpenDoc",
+  "description": "AI-powered project intelligence — analyze your workspace and get structured engineering reports.",
+  "version": "0.1.0",
+  "publisher": "opendoc",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "opendoc-container",
+          "title": "OpenDoc",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "opendoc-container": [
+        {
+          "type": "webview",
+          "id": "opendoc-sidebar",
+          "name": "OpenDoc"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "OpenDoc",
+      "properties": {
+        "opendoc.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for the LLM provider (Groq, OpenAI, etc.)",
+          "order": 1
+        },
+        "opendoc.backendUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "URL of the OpenDoc backend server",
+          "order": 2
+        },
+        "opendoc.provider": {
+          "type": "string",
+          "default": "groq",
+          "enum": [
+            "groq",
+            "openai",
+            "anthropic",
+            "google"
+          ],
+          "enumDescriptions": [
+            "Groq (Llama 3.3 70B — fast & free)",
+            "OpenAI (GPT-4o)",
+            "Anthropic (Claude 3.5 Sonnet)",
+            "Google (Gemini 2.5 Pro)"
+          ],
+          "description": "LLM provider to use for analysis",
+          "order": 3
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}

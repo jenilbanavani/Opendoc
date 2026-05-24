@@ -1,0 +1,20 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+venv/
+.venv/
+env/
+.env
+
+# VS Code extension dependencies and compiled output
+node_modules/
+out/
+.vscode/
+*.vsix
+.DS_Store
+
+# Local secrets or keys
+*.key
+*.pem
