@@ -6,6 +6,7 @@
  */
 
 import * as vscode from "vscode";
+import * as crypto from "crypto";
 import { getWorkspaceTree, readKeyFiles, analyzeFileContent } from "./utils/workspaceScanner";
 
 export class OpenDocViewProvider implements vscode.WebviewViewProvider {
@@ -13,8 +14,16 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
 
   private _view?: vscode.WebviewView;
   private _sessionFiles = new Map<string, { uri: vscode.Uri; action: "opened" | "edited" }>();
+  private _sessionId = "";
+  private _currentGoal = "";
+  private _snapshotTimeout?: NodeJS.Timeout;
+  private _snapshotInterval?: NodeJS.Timeout;
+  private _lastSnapshotJson = "";
 
   constructor(private readonly _extensionUri: vscode.Uri) {
+    // Generate unique session ID for version store
+    this._sessionId = this._generateUUID();
+
     // Track files opened during the session
     vscode.workspace.onDidOpenTextDocument((doc) => {
       this._trackFile(doc.uri, "opened");
@@ -24,6 +33,145 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
     vscode.workspace.onDidChangeTextDocument((e) => {
       this._trackFile(e.document.uri, "edited");
     });
+
+    // Track when files are saved
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      this._onFileSave();
+    });
+
+    // Start background check timer (2 minutes)
+    this._startSnapshotTimer();
+  }
+
+  private _generateUUID(): string {
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+      const r = (Math.random() * 16) | 0;
+      const v = c === "x" ? r : (r & 0x3) | 0x8;
+      return v.toString(16);
+    });
+  }
+
+  private _startSnapshotTimer() {
+    this._snapshotInterval = setInterval(() => {
+      this._sendSnapshot();
+    }, 120000); // 2 minutes
+  }
+
+  private _onFileSave() {
+    if (this._snapshotTimeout) {
+      clearTimeout(this._snapshotTimeout);
+    }
+    this._snapshotTimeout = setTimeout(() => {
+      this._sendSnapshot();
+    }, 3000); // 3 seconds debounce
+  }
+
+  private async _sendSnapshot(): Promise<void> {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+      return;
+    }
+
+    const editedFiles: { filename: string; functions: string[]; hash?: string }[] = [];
+
+    for (const [relativePath, entry] of this._sessionFiles.entries()) {
+      if (entry.action !== "edited") {
+        continue;
+      }
+      try {
+        const raw = await vscode.workspace.fs.readFile(entry.uri);
+        const content = Buffer.from(raw).toString("utf-8");
+        const { functions } = analyzeFileContent(content, relativePath);
+        const hash = crypto.createHash("sha1").update(content).digest("hex");
+        editedFiles.push({
+          filename: relativePath,
+          functions: functions,
+          hash: hash,
+        });
+      } catch {
+        // If file is deleted or unreadable
+        editedFiles.push({
+          filename: relativePath,
+          functions: [],
+        });
+      }
+    }
+
+    if (editedFiles.length === 0) {
+      return; // Nothing edited yet
+    }
+
+    const config = vscode.workspace.getConfiguration("opendoc");
+    const apiKey = config.get<string>("apiKey", "");
+    const backendUrl = config.get<string>("backendUrl", "http://localhost:8000");
+    const provider = config.get<string>("provider", "groq");
+    const model = config.get<string>("model", "");
+
+    const snapshotPayload = {
+      session_id: this._sessionId,
+      timestamp: new Date().toISOString(),
+      goal: this._currentGoal,
+      files: editedFiles,
+      provider: provider,
+      model: model || undefined,
+      api_key: apiKey || undefined,
+    };
+
+    // Deduplicate sends
+    const currentJson = JSON.stringify({
+      goal: snapshotPayload.goal,
+      files: snapshotPayload.files,
+    });
+
+    if (currentJson === this._lastSnapshotJson) {
+      return;
+    }
+
+    this._lastSnapshotJson = currentJson;
+
+    try {
+      const url = `${backendUrl.replace(/\/+$/, "")}/api/session/snapshot`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(snapshotPayload),
+      });
+
+      if (response.ok) {
+        const data = (await response.json()) as {
+          success?: boolean;
+          new_note?: string;
+          error?: string;
+        };
+        if (data.success) {
+          // Fetch notes history to refresh the UI
+          await this._fetchNotesHistory();
+        }
+      }
+    } catch (err) {
+      console.error("Failed to send snapshot to backend:", err);
+    }
+  }
+
+  private async _fetchNotesHistory(): Promise<void> {
+    const config = vscode.workspace.getConfiguration("opendoc");
+    const backendUrl = config.get<string>("backendUrl", "http://localhost:8000");
+
+    try {
+      const url = `${backendUrl.replace(/\/+$/, "")}/api/session/notes?session_id=${this._sessionId}`;
+      const response = await fetch(url);
+      if (response.ok) {
+        const data = (await response.json()) as {
+          success?: boolean;
+          notes?: any[];
+        };
+        if (data.success && data.notes) {
+          this._postMessage({ command: "notesHistory", notes: data.notes });
+        }
+      }
+    } catch (err) {
+      console.error("Failed to fetch notes history:", err);
+    }
   }
 
   private _trackFile(uri: vscode.Uri, action: "opened" | "edited") {
@@ -104,6 +252,12 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
           break;
         case "saveMarkdown":
           await this._handleSaveMarkdown(message.report);
+          break;
+        case "updateGoal":
+          this._currentGoal = message.goal;
+          break;
+        case "refreshNotes":
+          await this._fetchNotesHistory();
           break;
       }
     });
@@ -887,6 +1041,72 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
   }
 
   .hidden { display: none !important; }
+
+  /* ── Note Version History ── */
+  .history-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 4px;
+    max-height: 250px;
+    overflow-y: auto;
+    padding-right: 4px;
+  }
+  .history-item {
+    background: #ffffff;
+    border: 1px solid rgba(0, 0, 0, 0.06);
+    border-radius: 12px;
+    padding: 10px 12px;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.01);
+    transition: all 0.2s ease;
+    animation: fadeIn 0.2s ease;
+  }
+  .history-item:hover {
+    border-color: rgba(0, 0, 0, 0.1);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.03);
+  }
+  .history-item-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 4px;
+    gap: 6px;
+  }
+  .history-item-time {
+    font-size: 9px;
+    font-weight: 700;
+    color: #2563eb;
+    background: rgba(37, 99, 235, 0.08);
+    padding: 2px 6px;
+    border-radius: 20px;
+    white-space: nowrap;
+  }
+  .history-item-goal {
+    font-size: 9px;
+    font-weight: 600;
+    color: #4b5563;
+    background: rgba(0, 0, 0, 0.04);
+    padding: 2px 6px;
+    border-radius: 20px;
+    max-width: 60%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .history-item-summary {
+    font-size: 11px;
+    line-height: 1.4;
+    color: #1f2937;
+  }
+  .history-empty {
+    font-size: 11px;
+    color: #6b7280;
+    text-align: center;
+    padding: 16px;
+    border: 1px dashed rgba(0, 0, 0, 0.08);
+    border-radius: 12px;
+    background: rgba(0, 0, 0, 0.005);
+  }
 </style>
 </head>
 <body>
@@ -918,6 +1138,11 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
       <option value="custom">Custom Report (Select Sections)</option>
     </select>
   </div>
+
+  <div style="display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px;">
+    <span style="font-size: 10px; font-weight: 700; text-transform: uppercase; color: #4b5563; letter-spacing: 0.5px; padding-left: 2px;">Current Goal</span>
+    <input type="text" id="currentGoal" class="mode-select" placeholder="Optional: e.g. Add authentication middleware" style="width: 100%;">
+  </div>
   
   <div id="customSections" class="custom-sections hidden">
     <label class="checkbox-item"><input type="checkbox" id="chk_architecture" checked><span>Architecture Notes</span></label>
@@ -947,6 +1172,17 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
   <button class="export-btn" id="saveMDBtn">📝 Save Markdown</button>
 </div>
 
+<!-- Note Version History (Git for Notes) -->
+<div class="version-history-section" style="padding: 16px; border-top: 1px solid rgba(0, 0, 0, 0.06); margin-top: 10px; display: flex; flex-direction: column; gap: 10px;">
+  <div style="display: flex; align-items: center; justify-content: space-between;">
+    <span style="font-size: 10px; font-weight: 700; text-transform: uppercase; color: #4b5563; letter-spacing: 0.5px; padding-left: 2px;">Note Version History</span>
+    <button class="settings-btn" id="refreshNotesBtn" title="Refresh Notes" style="font-size: 12px; padding: 2px;">🔄</button>
+  </div>
+  <div id="notesHistoryList" class="history-list">
+    <div class="history-empty">No versions stored yet. Save files to record commits.</div>
+  </div>
+</div>
+
 
 <script>
 (function() {
@@ -962,6 +1198,9 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
   const exportPanel = document.getElementById('exportPanel');
   const savePdfBtn = document.getElementById('savePdfBtn');
   const saveMDBtn = document.getElementById('saveMDBtn');
+  const currentGoalInput = document.getElementById('currentGoal');
+  const refreshNotesBtn = document.getElementById('refreshNotesBtn');
+  const notesHistoryList = document.getElementById('notesHistoryList');
 
   let currentReport = null;
 
@@ -1031,6 +1270,17 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
     }
   });
 
+  currentGoalInput.addEventListener('input', () => {
+    vscode.postMessage({
+      command: 'updateGoal',
+      goal: currentGoalInput.value
+    });
+  });
+
+  refreshNotesBtn.addEventListener('click', () => {
+    vscode.postMessage({ command: 'refreshNotes' });
+  });
+
   window.addEventListener('message', (event) => {
     const msg = event.data;
 
@@ -1067,6 +1317,10 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
         analyzeBtn.disabled = false;
         devNotesBtn.disabled = false;
         renderDevNotes(msg.devNotes);
+        break;
+
+      case 'notesHistory':
+        renderNotesHistory(msg.notes);
         break;
     }
   });
@@ -1238,6 +1492,43 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
     if (!s) return '';
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
+
+  function renderNotesHistory(notes) {
+    if (!notes || notes.length === 0) {
+      notesHistoryList.innerHTML = '<div class="history-empty">No versions stored yet. Save files to record commits.</div>';
+      return;
+    }
+
+    notesHistoryList.innerHTML = notes.map(note => {
+      const timeStr = formatTime(note.timestamp);
+      const goalHtml = note.goal ? '<span class="history-item-goal" title="' + escapeHtml(note.goal) + '">' + escapeHtml(note.goal) + '</span>' : '';
+      return '<div class="history-item">'
+        + '<div class="history-item-header">'
+        + '<span class="history-item-time">' + timeStr + '</span>'
+        + goalHtml
+        + '</div>'
+        + '<div class="history-item-summary">' + escapeHtml(note.summary) + '</div>'
+        + '</div>';
+    }).join('');
+  }
+
+  function formatTime(isoStr) {
+    try {
+      const date = new Date(isoStr);
+      let hours = date.getHours();
+      const minutes = date.getMinutes();
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12;
+      hours = hours ? hours : 12; // the hour '0' should be '12'
+      const minStr = minutes < 10 ? '0' + minutes : minutes;
+      return hours + ':' + minStr + ' ' + ampm;
+    } catch (e) {
+      return isoStr;
+    }
+  }
+
+  // Load initial notes history
+  vscode.postMessage({ command: 'refreshNotes' });
 })();
 </script>
 </body>

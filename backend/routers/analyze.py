@@ -17,11 +17,17 @@ from models.schemas import (
     ReportData,
     DevNotesRequest,
     DevNotesResponse,
+    SnapshotRequest,
+    SnapshotResponse,
+    NotesListResponse,
+    NoteVersionItem,
 )
 from services.github_service import build_repo_context, parse_github_url
 from services.ai_service import generate_report
 from services.pdf_service import generate_pdf_bytes
 from services.dev_notes_service import generate_dev_notes
+from services.snapshot_service import process_snapshot
+from services.db_service import get_note_versions
 
 logger = logging.getLogger(__name__)
 
@@ -233,3 +239,59 @@ async def generate_pdf(request: PDFRequest):
             status_code=500,
             detail=f"PDF generation failed: {str(e)}",
         )
+
+
+@router.post("/session/snapshot", response_model=SnapshotResponse)
+async def save_session_snapshot(request: SnapshotRequest):
+    """
+    Receive a session workspace snapshot from the VS Code extension.
+    Saves the files/functions and optionally generates an AI diff note version.
+    """
+    try:
+        logger.info(f"Received snapshot save request for session: {request.session_id}")
+        
+        # Convert Pydantic file list to plain list of dicts for the service
+        files_list = [{"filename": f.filename, "functions": f.functions, "hash": f.hash} for f in request.files]
+        
+        new_note = await process_snapshot(
+            session_id=request.session_id,
+            timestamp=request.timestamp,
+            goal=request.goal or "",
+            files=files_list,
+            provider=request.provider,
+            model=request.model,
+            api_key=request.api_key,
+        )
+        
+        return SnapshotResponse(success=True, new_note=new_note)
+        
+    except Exception as e:
+        logger.exception(f"Unexpected error saving snapshot for session {request.session_id}")
+        return SnapshotResponse(success=False, error=str(e))
+
+
+@router.get("/session/notes", response_model=NotesListResponse)
+async def get_session_notes(session_id: str):
+    """
+    Retrieve all AI generated note versions for a specific session.
+    """
+    try:
+        logger.info(f"Retrieving note versions for session: {session_id}")
+        notes = get_note_versions(session_id)
+        
+        # Map to response objects
+        note_items = [
+            NoteVersionItem(
+                timestamp=note["timestamp"],
+                summary=note["summary"],
+                goal=note.get("goal")
+            )
+            for note in notes
+        ]
+        
+        return NotesListResponse(success=True, notes=note_items)
+        
+    except Exception as e:
+        logger.exception(f"Unexpected error fetching notes for session {session_id}")
+        return NotesListResponse(success=False, error=str(e))
+

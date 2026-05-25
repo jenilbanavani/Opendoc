@@ -18,3 +18,7 @@ out/
 # Local secrets or keys
 *.key
 *.pem
+
+# Local databases
+*.db
+

@@ -7,12 +7,17 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
 from routers.analyze import router as analyze_router
+from services.db_service import init_db
 
 app = FastAPI(
     title="OpenDoc API",
     description="AI-powered developer documentation and project intelligence.",
     version="1.0.0",
 )
+
+@app.on_event("startup")
+async def startup_event():
+    init_db()
 
 # CORS — allow the Chrome extension (and dev tools) to call us
 app.add_middleware(

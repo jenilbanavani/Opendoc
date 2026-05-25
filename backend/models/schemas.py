@@ -153,3 +153,43 @@ class DevNotesResponse(BaseModel):
     dev_notes: Optional[DevNotesData] = None
     error: Optional[str] = None
 
+
+class SnapshotFile(BaseModel):
+    """File details tracked inside a session snapshot."""
+    filename: str
+    functions: list[str] = Field(default_factory=list)
+    hash: Optional[str] = Field(default=None, description="SHA-1 hash of the file content")
+
+
+class SnapshotRequest(BaseModel):
+    """Request body for saving a session snapshot."""
+    session_id: str = Field(..., description="Unique workspace session ID")
+    timestamp: str = Field(..., description="ISO 8601 Timestamp when save occurred")
+    goal: Optional[str] = Field(default=None, description="Current developer goal")
+    files: list[SnapshotFile] = Field(default_factory=list, description="List of files edited in this session")
+    provider: str = Field(default="groq", description="LLM Provider")
+    model: Optional[str] = Field(default=None, description="Model to use")
+    api_key: Optional[str] = Field(default=None, description="API key")
+
+
+class SnapshotResponse(BaseModel):
+    """Response body for the /api/session/snapshot endpoint."""
+    success: bool = True
+    new_note: Optional[str] = Field(default=None, description="New AI note version description if generated")
+    error: Optional[str] = None
+
+
+class NoteVersionItem(BaseModel):
+    """A single note version changelog entry."""
+    timestamp: str
+    summary: str
+    goal: Optional[str] = None
+
+
+class NotesListResponse(BaseModel):
+    """Response body for the /api/session/notes endpoint."""
+    success: bool = True
+    notes: list[NoteVersionItem] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
