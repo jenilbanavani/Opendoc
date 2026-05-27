@@ -131,7 +131,7 @@ export async function readKeyFiles(
 ): Promise<Record<string, string>> {
   const result: Record<string, string> = {};
 
-  // Get the list of files at root level
+  // 1. Get the list of files at root level (configs, README, etc.)
   let rootEntries: [string, vscode.FileType][];
   try {
     rootEntries = await vscode.workspace.fs.readDirectory(rootUri);
@@ -159,6 +159,133 @@ export async function readKeyFiles(
       const raw = await vscode.workspace.fs.readFile(fileUri);
       const content = Buffer.from(raw).toString("utf-8");
       result[match] = content.slice(0, MAX_FILE_CHARS);
+    } catch {
+      // Skip unreadable files
+    }
+  }
+
+  // 2. Recursively find important source code files to extract technical signals
+  const sourceExtensions = new Set([
+    ".py",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".go",
+    ".rs",
+    ".cs",
+    ".java",
+    ".rb",
+    ".php",
+    ".cpp",
+    ".h",
+    ".c",
+  ]);
+  const allSourceFiles: { relPath: string; uri: vscode.Uri }[] = [];
+
+  async function walk(dirUri: vscode.Uri, relPathPrefix: string): Promise<void> {
+    let entries: [string, vscode.FileType][];
+    try {
+      entries = await vscode.workspace.fs.readDirectory(dirUri);
+    } catch {
+      return;
+    }
+
+    for (const [name, type] of entries) {
+      if (type === vscode.FileType.Directory) {
+        if (IGNORED_DIRS.has(name) || name.startsWith(".")) {
+          continue;
+        }
+        const childUri = vscode.Uri.joinPath(dirUri, name);
+        await walk(childUri, relPathPrefix ? `${relPathPrefix}/${name}` : name);
+      } else {
+        if (name.startsWith(".")) {
+          continue;
+        }
+        const cleanExt = path.extname(name).toLowerCase();
+        if (sourceExtensions.has(cleanExt)) {
+          const fileRelPath = relPathPrefix ? `${relPathPrefix}/${name}` : name;
+          allSourceFiles.push({
+            relPath: fileRelPath,
+            uri: vscode.Uri.joinPath(dirUri, name),
+          });
+        }
+      }
+    }
+  }
+
+  await walk(rootUri, "");
+
+  // Score files to select top 12
+  const scoredFiles: { score: number; relPath: string; uri: vscode.Uri }[] = [];
+  for (const file of allSourceFiles) {
+    const basename = path.basename(file.relPath).toLowerCase();
+    const relPathLower = file.relPath.toLowerCase();
+    let score = 0;
+
+    // High priority: Entry points
+    if (
+      [
+        "main.py",
+        "app.py",
+        "index.js",
+        "index.ts",
+        "server.js",
+        "server.ts",
+        "main.go",
+        "main.rs",
+        "app.js",
+        "app.ts",
+      ].includes(basename)
+    ) {
+      score += 100;
+    } else if (
+      ["main", "app", "server", "index"].some((k) => basename.includes(k))
+    ) {
+      score += 50;
+    }
+
+    // High priority: routes, controllers, services, models
+    if (
+      ["router", "route", "controller", "service", "model", "api", "handler"].some(
+        (k) => relPathLower.includes(k)
+      )
+    ) {
+      score += 30;
+    }
+
+    // High priority: src, app, backend, lib folders
+    if (
+      ["src/", "app/", "backend/", "lib/"].some((k) => relPathLower.includes(k))
+    ) {
+      score += 10;
+    }
+
+    // Ignore test/spec/mock files
+    if (
+      ["test", "spec", "mock"].some(
+        (k) => basename.includes(k) || relPathLower.includes(k)
+      )
+    ) {
+      score = -100;
+    }
+
+    scoredFiles.push({ score, relPath: file.relPath, uri: file.uri });
+  }
+
+  // Sort descending by score, filter out files with negative scores, and limit to 12
+  scoredFiles.sort((a, b) => b.score - a.score);
+  const selectedSources = scoredFiles.filter((f) => f.score >= -50).slice(0, 12);
+
+  // Read content of selected source files
+  for (const file of selectedSources) {
+    if (result[file.relPath]) {
+      continue; // Skip if already read (e.g. root files)
+    }
+    try {
+      const raw = await vscode.workspace.fs.readFile(file.uri);
+      const content = Buffer.from(raw).toString("utf-8");
+      result[file.relPath] = content.slice(0, MAX_FILE_CHARS);
     } catch {
       // Skip unreadable files
     }

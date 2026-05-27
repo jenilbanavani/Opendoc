@@ -17,8 +17,8 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
   private _sessionId = "";
   private _currentGoal = "";
   private _snapshotTimeout?: NodeJS.Timeout;
-  private _snapshotInterval?: NodeJS.Timeout;
   private _lastSnapshotJson = "";
+  private _lastCapturedFiles = new Map<string, { imports: string[]; functions: string[] }>();
 
   constructor(private readonly _extensionUri: vscode.Uri) {
     // Generate unique session ID for version store
@@ -34,13 +34,10 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
       this._trackFile(e.document.uri, "edited");
     });
 
-    // Track when files are saved
+    // Track when files are saved and check for major changes
     vscode.workspace.onDidSaveTextDocument((doc) => {
-      this._onFileSave();
+      this._onFileSave(doc);
     });
-
-    // Start background check timer (2 minutes)
-    this._startSnapshotTimer();
   }
 
   private _generateUUID(): string {
@@ -51,54 +48,106 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private _startSnapshotTimer() {
-    this._snapshotInterval = setInterval(() => {
-      this._sendSnapshot();
-    }, 120000); // 2 minutes
-  }
-
-  private _onFileSave() {
-    if (this._snapshotTimeout) {
-      clearTimeout(this._snapshotTimeout);
+  private async _onFileSave(doc: vscode.TextDocument) {
+    // Only track workspace files
+    const folder = vscode.workspace.getWorkspaceFolder(doc.uri);
+    if (!folder || doc.uri.scheme !== "file") {
+      return;
     }
-    this._snapshotTimeout = setTimeout(() => {
-      this._sendSnapshot();
-    }, 3000); // 3 seconds debounce
+    const relativePath = vscode.workspace.asRelativePath(doc.uri, false);
+    
+    // Ignore ignored files
+    const parts = relativePath.split(/[\\/]/);
+    const ignoredFolders = [
+      "node_modules",
+      ".git",
+      "__pycache__",
+      ".vscode",
+      ".idea",
+      "venv",
+      ".venv",
+      "env",
+      ".env",
+      "dist",
+      "build",
+      "out",
+    ];
+
+    if (parts.some((p) => ignoredFolders.includes(p))) {
+      return;
+    }
+
+    try {
+      const content = doc.getText();
+      const currentSig = analyzeFileContent(content, relativePath);
+      
+      const lastSig = this._lastCapturedFiles.get(relativePath);
+      let isMajorChange = false;
+      if (!lastSig) {
+        isMajorChange = true;
+      } else {
+        const importsChanged = JSON.stringify(currentSig.imports) !== JSON.stringify(lastSig.imports);
+        const functionsChanged = JSON.stringify(currentSig.functions) !== JSON.stringify(lastSig.functions);
+        if (importsChanged || functionsChanged) {
+          isMajorChange = true;
+        }
+      }
+
+      if (isMajorChange) {
+        // Update signature cache and tracking state
+        this._lastCapturedFiles.set(relativePath, currentSig);
+        this._sessionFiles.set(relativePath, { uri: doc.uri, action: "edited" });
+
+        if (this._snapshotTimeout) {
+          clearTimeout(this._snapshotTimeout);
+        }
+        this._snapshotTimeout = setTimeout(() => {
+          this._sendSessionState();
+        }, 3000); // 3 seconds debounce
+      }
+    } catch (err) {
+      console.error("Error evaluating file save triggers:", err);
+    }
   }
 
-  private async _sendSnapshot(): Promise<void> {
+  private async _sendSessionState(force = false): Promise<void> {
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders || workspaceFolders.length === 0) {
       return;
     }
 
-    const editedFiles: { filename: string; functions: string[]; hash?: string }[] = [];
+    const editedFiles: { filename: string; functions: string[]; imports: string[]; hash?: string }[] = [];
 
     for (const [relativePath, entry] of this._sessionFiles.entries()) {
-      if (entry.action !== "edited") {
+      if (entry.action !== "edited" && !force) {
         continue;
       }
       try {
         const raw = await vscode.workspace.fs.readFile(entry.uri);
         const content = Buffer.from(raw).toString("utf-8");
-        const { functions } = analyzeFileContent(content, relativePath);
+        const { functions, imports } = analyzeFileContent(content, relativePath);
         const hash = crypto.createHash("sha1").update(content).digest("hex");
         editedFiles.push({
           filename: relativePath,
           functions: functions,
+          imports: imports,
           hash: hash,
         });
+
+        // Seed signature cache
+        this._lastCapturedFiles.set(relativePath, { functions, imports });
       } catch {
         // If file is deleted or unreadable
         editedFiles.push({
           filename: relativePath,
           functions: [],
+          imports: [],
         });
       }
     }
 
-    if (editedFiles.length === 0) {
-      return; // Nothing edited yet
+    if (editedFiles.length === 0 && !force) {
+      return; // Nothing edited yet and not forced
     }
 
     const config = vscode.workspace.getConfiguration("opendoc");
@@ -107,7 +156,7 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
     const provider = config.get<string>("provider", "groq");
     const model = config.get<string>("model", "");
 
-    const snapshotPayload = {
+    const sessionStatePayload = {
       session_id: this._sessionId,
       timestamp: new Date().toISOString(),
       goal: this._currentGoal,
@@ -119,22 +168,22 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
 
     // Deduplicate sends
     const currentJson = JSON.stringify({
-      goal: snapshotPayload.goal,
-      files: snapshotPayload.files,
+      goal: sessionStatePayload.goal,
+      files: sessionStatePayload.files,
     });
 
-    if (currentJson === this._lastSnapshotJson) {
+    if (currentJson === this._lastSnapshotJson && !force) {
       return;
     }
 
     this._lastSnapshotJson = currentJson;
 
     try {
-      const url = `${backendUrl.replace(/\/+$/, "")}/api/session/snapshot`;
+      const url = `${backendUrl.replace(/\/+$/, "")}/api/session/state`;
       const response = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(snapshotPayload),
+        body: JSON.stringify(sessionStatePayload),
       });
 
       if (response.ok) {
@@ -149,7 +198,7 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
         }
       }
     } catch (err) {
-      console.error("Failed to send snapshot to backend:", err);
+      console.error("Failed to send session state to backend:", err);
     }
   }
 
@@ -258,6 +307,20 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
           break;
         case "refreshNotes":
           await this._fetchNotesHistory();
+          break;
+        case "recordSessionState":
+          await this._sendSessionState(true);
+          vscode.window.showInformationMessage("Session evolution state captured.");
+          break;
+        case "newSession":
+          this._sessionId = this._generateUUID();
+          this._sessionFiles.clear();
+          this._lastCapturedFiles.clear();
+          this._lastSnapshotJson = "";
+          this._currentGoal = "";
+          this._postMessage({ command: "clearGoal" });
+          await this._fetchNotesHistory();
+          vscode.window.showInformationMessage("Started a new OpenDoc evolution tracking session.");
           break;
       }
     });
@@ -377,6 +440,9 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
       });
       return;
     }
+
+    // Force send any outstanding state changes to the database first
+    await this._sendSessionState(true);
 
     if (this._sessionFiles.size === 0) {
       this._postMessage({
@@ -1107,6 +1173,57 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
     border-radius: 12px;
     background: rgba(0, 0, 0, 0.005);
   }
+  .history-item-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 6px;
+  }
+  .badge {
+    font-size: 9px;
+    font-weight: 500;
+    padding: 1px 6px;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  .badge-lang {
+    background: rgba(16, 185, 129, 0.1);
+    color: #047857;
+    border: 1px solid rgba(16, 185, 129, 0.15);
+  }
+  .badge-files {
+    background: rgba(245, 158, 11, 0.1);
+    color: #b45309;
+    border: 1px solid rgba(245, 158, 11, 0.15);
+  }
+  .badge-duration {
+    background: rgba(99, 102, 241, 0.1);
+    color: #4f46e5;
+    border: 1px solid rgba(99, 102, 241, 0.15);
+  }
+  .badge-focus {
+    background: rgba(239, 68, 68, 0.1);
+    color: #b91c1c;
+    border: 1px solid rgba(239, 68, 68, 0.15);
+  }
+  .badge-pattern {
+    background: rgba(107, 114, 128, 0.1);
+    color: #374151;
+    border: 1px solid rgba(107, 114, 128, 0.15);
+  }
+  .history-item-details {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px dashed rgba(0, 0, 0, 0.05);
+    font-size: 10px;
+    color: #4b5563;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .detail-section {
+    line-height: 1.3;
+  }
 </style>
 </head>
 <body>
@@ -1118,7 +1235,10 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
       <div class="logo-icon">O</div>
       <span class="logo-text">OpenDoc</span>
     </div>
-    <button class="settings-btn" id="settingsBtn" title="Settings">⚙️</button>
+    <div style="display: flex; gap: 4px;">
+      <button class="settings-btn" id="newSessionBtn" title="Start New Session">🆕</button>
+      <button class="settings-btn" id="settingsBtn" title="Settings">⚙️</button>
+    </div>
   </div>
   <div class="workspace-badge">
     <span class="dot"></span>
@@ -1126,36 +1246,17 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
   </div>
 </div>
 
+
 <!-- Action Area -->
 <div class="action-area">
-  <div style="display: flex; flex-direction: column; gap: 4px; margin-bottom: 4px;">
-    <span style="font-size: 10px; font-weight: 700; text-transform: uppercase; color: #4b5563; letter-spacing: 0.5px; padding-left: 2px;">Report Mode</span>
-    <select id="reportMode" class="mode-select">
-      <option value="client" selected>Client Report (Business-centric)</option>
-      <option value="learning">Learning Report (Growth-centric)</option>
-      <option value="understanding">Understanding Report (Codebase guide)</option>
-      <option value="portfolio">Portfolio Report (Recruiter-friendly)</option>
-      <option value="custom">Custom Report (Select Sections)</option>
-    </select>
-  </div>
-
   <div style="display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px;">
     <span style="font-size: 10px; font-weight: 700; text-transform: uppercase; color: #4b5563; letter-spacing: 0.5px; padding-left: 2px;">Current Goal</span>
     <input type="text" id="currentGoal" class="mode-select" placeholder="Optional: e.g. Add authentication middleware" style="width: 100%;">
   </div>
-  
-  <div id="customSections" class="custom-sections hidden">
-    <label class="checkbox-item"><input type="checkbox" id="chk_architecture" checked><span>Architecture Notes</span></label>
-    <label class="checkbox-item"><input type="checkbox" id="chk_risks" checked><span>Risks & Weaknesses</span></label>
-    <label class="checkbox-item"><input type="checkbox" id="chk_learning" checked><span>Learning Insights</span></label>
-    <label class="checkbox-item"><input type="checkbox" id="chk_startup" checked><span>Startup Analysis</span></label>
-    <label class="checkbox-item"><input type="checkbox" id="chk_developer" checked><span>Developer Notes</span></label>
-    <label class="checkbox-item"><input type="checkbox" id="chk_strengths" checked><span>Strengths & Weaknesses</span></label>
-    <label class="checkbox-item"><input type="checkbox" id="chk_roadmap" checked><span>Roadmap Suggestions</span></label>
-  </div>
 
   <button class="analyze-btn" id="analyzeBtn">⚡ Analyze Project</button>
   <button class="devnotes-btn" id="devNotesBtn">📝 Generate Dev Notes</button>
+  <button class="devnotes-btn" id="recordStateBtn" style="margin-top: 4px;">💾 Capture Evolution State</button>
 </div>
 
 <!-- Status Area -->
@@ -1172,14 +1273,14 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
   <button class="export-btn" id="saveMDBtn">📝 Save Markdown</button>
 </div>
 
-<!-- Note Version History (Git for Notes) -->
+<!-- Session Evolution History -->
 <div class="version-history-section" style="padding: 16px; border-top: 1px solid rgba(0, 0, 0, 0.06); margin-top: 10px; display: flex; flex-direction: column; gap: 10px;">
   <div style="display: flex; align-items: center; justify-content: space-between;">
-    <span style="font-size: 10px; font-weight: 700; text-transform: uppercase; color: #4b5563; letter-spacing: 0.5px; padding-left: 2px;">Note Version History</span>
+    <span style="font-size: 10px; font-weight: 700; text-transform: uppercase; color: #4b5563; letter-spacing: 0.5px; padding-left: 2px;">Session Evolution History</span>
     <button class="settings-btn" id="refreshNotesBtn" title="Refresh Notes" style="font-size: 12px; padding: 2px;">🔄</button>
   </div>
   <div id="notesHistoryList" class="history-list">
-    <div class="history-empty">No versions stored yet. Save files to record commits.</div>
+    <div class="history-empty">No evolution states recorded yet. Save changes to trigger an update.</div>
   </div>
 </div>
 
@@ -1189,12 +1290,12 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
   const vscode = acquireVsCodeApi();
   const analyzeBtn = document.getElementById('analyzeBtn');
   const devNotesBtn = document.getElementById('devNotesBtn');
+  const recordStateBtn = document.getElementById('recordStateBtn');
+  const newSessionBtn = document.getElementById('newSessionBtn');
   const settingsBtn = document.getElementById('settingsBtn');
   const statusArea = document.getElementById('statusArea');
   const statusMsg = document.getElementById('statusMsg');
   const reportArea = document.getElementById('reportArea');
-  const reportModeSelect = document.getElementById('reportMode');
-  const customSectionsDiv = document.getElementById('customSections');
   const exportPanel = document.getElementById('exportPanel');
   const savePdfBtn = document.getElementById('savePdfBtn');
   const saveMDBtn = document.getElementById('saveMDBtn');
@@ -1204,44 +1305,16 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
 
   let currentReport = null;
 
-  // Toggle custom checkboxes container visibility
-  reportModeSelect.addEventListener('change', (e) => {
-    if (e.target.value === 'custom') {
-      customSectionsDiv.classList.remove('hidden');
-    } else {
-      customSectionsDiv.classList.add('hidden');
-    }
-  });
-
   analyzeBtn.addEventListener('click', () => {
-    const reportMode = reportModeSelect.value;
-    let customSections = [];
-    
-    if (reportMode === 'custom') {
-      const mappings = [
-        ['chk_architecture', 'architecture_notes'],
-        ['chk_risks', 'risks'],
-        ['chk_learning', 'learning_insights'],
-        ['chk_startup', 'startup_analysis'],
-        ['chk_developer', 'developer_notes'],
-        ['chk_strengths', 'strengths_weaknesses'],
-        ['chk_roadmap', 'roadmap_suggestions']
-      ];
-      mappings.forEach(([chkId, sectionKey]) => {
-        if (document.getElementById(chkId).checked) {
-          customSections.push(sectionKey);
-        }
-      });
-    }
-
     vscode.postMessage({
       command: 'analyze',
-      reportMode: reportMode,
-      customSections: customSections
+      reportMode: 'client',
+      customSections: []
     });
 
     analyzeBtn.disabled = true;
     devNotesBtn.disabled = true;
+    recordStateBtn.disabled = true;
     reportArea.classList.add('hidden');
     exportPanel.classList.add('hidden');
   });
@@ -1250,14 +1323,25 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
     vscode.postMessage({ command: 'generateDevNotes' });
     analyzeBtn.disabled = true;
     devNotesBtn.disabled = true;
+    recordStateBtn.disabled = true;
     reportArea.classList.add('hidden');
     exportPanel.classList.add('hidden');
+  });
+
+  recordStateBtn.addEventListener('click', () => {
+    vscode.postMessage({ command: 'recordSessionState' });
+    analyzeBtn.disabled = true;
+    devNotesBtn.disabled = true;
+    recordStateBtn.disabled = true;
+  });
+
+  newSessionBtn.addEventListener('click', () => {
+    vscode.postMessage({ command: 'newSession' });
   });
 
   settingsBtn.addEventListener('click', () => {
     vscode.postMessage({ command: 'openSettings' });
   });
-
   savePdfBtn.addEventListener('click', () => {
     if (currentReport) {
       vscode.postMessage({ command: 'savePdf', report: currentReport });
@@ -1301,12 +1385,14 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
         statusMsg.innerHTML = '⚠ ' + escapeHtml(msg.text);
         analyzeBtn.disabled = false;
         devNotesBtn.disabled = false;
+        recordStateBtn.disabled = false;
         break;
 
       case 'report':
         statusArea.classList.add('hidden');
         analyzeBtn.disabled = false;
         devNotesBtn.disabled = false;
+        recordStateBtn.disabled = false;
         currentReport = msg.report;
         renderReport(msg.report);
         exportPanel.classList.remove('hidden');
@@ -1316,11 +1402,19 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
         statusArea.classList.add('hidden');
         analyzeBtn.disabled = false;
         devNotesBtn.disabled = false;
+        recordStateBtn.disabled = false;
         renderDevNotes(msg.devNotes);
         break;
 
       case 'notesHistory':
+        analyzeBtn.disabled = false;
+        devNotesBtn.disabled = false;
+        recordStateBtn.disabled = false;
         renderNotesHistory(msg.notes);
+        break;
+
+      case 'clearGoal':
+        currentGoalInput.value = '';
         break;
     }
   });
@@ -1493,21 +1587,60 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
+  function formatDuration(sec) {
+    if (!sec || sec < 1) return '0s';
+    if (sec < 60) return Math.round(sec) + 's';
+    const min = Math.floor(sec / 60);
+    const remainingSec = Math.round(sec % 60);
+    return min + 'm ' + remainingSec + 's';
+  }
+
   function renderNotesHistory(notes) {
     if (!notes || notes.length === 0) {
-      notesHistoryList.innerHTML = '<div class="history-empty">No versions stored yet. Save files to record commits.</div>';
+      notesHistoryList.innerHTML = '<div class="history-empty">No evolution states recorded yet. Save changes to trigger an update.</div>';
       return;
     }
 
     notesHistoryList.innerHTML = notes.map(note => {
       const timeStr = formatTime(note.timestamp);
-      const goalHtml = note.goal ? '<span class="history-item-goal" title="' + escapeHtml(note.goal) + '">' + escapeHtml(note.goal) + '</span>' : '';
+      const goalHtml = note.goal ? '<span class="history-item-goal" title="' + escapeHtml(note.goal) + '">🎯 ' + escapeHtml(note.goal) + '</span>' : '';
+      
+      // Badges
+      let badgesHtml = '';
+      if (note.primary_language) {
+        badgesHtml += '<span class="badge badge-lang">' + escapeHtml(note.primary_language) + '</span>';
+      }
+      if (note.files_changed_count) {
+        badgesHtml += '<span class="badge badge-files">📁 ' + note.files_changed_count + ' file' + (note.files_changed_count > 1 ? 's' : '') + '</span>';
+      }
+      if (note.session_duration) {
+        badgesHtml += '<span class="badge badge-duration">⏱️ ' + formatDuration(note.session_duration) + '</span>';
+      }
+      if (note.major_focus) {
+        badgesHtml += '<span class="badge badge-focus">🔍 ' + escapeHtml(note.major_focus) + '</span>';
+      }
+      if (note.detected_patterns && note.detected_patterns.length > 0) {
+        note.detected_patterns.forEach(pat => {
+          badgesHtml += '<span class="badge badge-pattern">' + escapeHtml(pat) + '</span>';
+        });
+      }
+
+      let extraDetailsHtml = '';
+      if (note.architecture_evolution || note.development_progression) {
+        extraDetailsHtml = '<div class="history-item-details">'
+          + (note.architecture_evolution ? '<div class="detail-section"><strong>Architecture:</strong> ' + escapeHtml(note.architecture_evolution) + '</div>' : '')
+          + (note.development_progression ? '<div class="detail-section"><strong>Progression:</strong> ' + escapeHtml(note.development_progression) + '</div>' : '')
+          + '</div>';
+      }
+
       return '<div class="history-item">'
         + '<div class="history-item-header">'
         + '<span class="history-item-time">' + timeStr + '</span>'
         + goalHtml
         + '</div>'
-        + '<div class="history-item-summary">' + escapeHtml(note.summary) + '</div>'
+        + '<div class="history-item-summary">' + escapeHtml(note.intent_summary || note.summary) + '</div>'
+        + (badgesHtml ? '<div class="history-item-badges">' + badgesHtml + '</div>' : '')
+        + extraDetailsHtml
         + '</div>';
     }).join('');
   }

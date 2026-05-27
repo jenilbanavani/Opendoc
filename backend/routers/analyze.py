@@ -17,8 +17,8 @@ from models.schemas import (
     ReportData,
     DevNotesRequest,
     DevNotesResponse,
-    SnapshotRequest,
-    SnapshotResponse,
+    SessionStateRequest,
+    SessionStateResponse,
     NotesListResponse,
     NoteVersionItem,
 )
@@ -26,8 +26,8 @@ from services.github_service import build_repo_context, parse_github_url
 from services.ai_service import generate_report
 from services.pdf_service import generate_pdf_bytes
 from services.dev_notes_service import generate_dev_notes
-from services.snapshot_service import process_snapshot
-from services.db_service import get_note_versions
+from services.session_state_service import process_session_state
+from services.db_service import get_evolution_notes
 
 logger = logging.getLogger(__name__)
 
@@ -93,31 +93,14 @@ async def analyze_local_project(request: AnalyzeLocalRequest):
     try:
         logger.info(f"Analyzing local project: {request.project_name}")
 
-        # Build context string from local project data
-        context_parts = []
+        # Build context string using the signal extractor
+        from services.signal_extractor import build_unified_context
+        context_string = build_unified_context(
+            project_name=request.project_name,
+            folder_structure=request.folder_structure,
+            files=request.files
+        )
 
-        context_parts.append("=== PROJECT METADATA ===")
-        context_parts.append(f"Name: {request.project_name}")
-        context_parts.append(f"Source: Local workspace (VS Code)")
-        context_parts.append("")
-
-        context_parts.append("=== FILE STRUCTURE ===")
-        context_parts.append(request.folder_structure)
-        context_parts.append("")
-
-        for fname, content in request.files.items():
-            context_parts.append(f"=== FILE: {fname} ===")
-            context_parts.append(content)
-            context_parts.append("")
-
-        context_string = "\n".join(context_parts)
-
-        # Trim if too long
-        if len(context_string) > 12000:
-            context_string = (
-                context_string[:12000]
-                + "\n\n[... context trimmed for token economy ...]"
-            )
 
         # Generate AI report using existing service
         report = await generate_report(
@@ -241,19 +224,27 @@ async def generate_pdf(request: PDFRequest):
         )
 
 
-@router.post("/session/snapshot", response_model=SnapshotResponse)
-async def save_session_snapshot(request: SnapshotRequest):
+@router.post("/session/state", response_model=SessionStateResponse)
+async def save_session_state(request: SessionStateRequest):
     """
-    Receive a session workspace snapshot from the VS Code extension.
-    Saves the files/functions and optionally generates an AI diff note version.
+    Receive a session workspace state from the VS Code extension.
+    Saves the files/functions/imports and optionally generates an AI diff note version.
     """
     try:
-        logger.info(f"Received snapshot save request for session: {request.session_id}")
+        logger.info(f"Received session state save request for session: {request.session_id}")
         
         # Convert Pydantic file list to plain list of dicts for the service
-        files_list = [{"filename": f.filename, "functions": f.functions, "hash": f.hash} for f in request.files]
+        files_list = [
+            {
+                "filename": f.filename,
+                "functions": f.functions,
+                "imports": f.imports,
+                "hash": f.hash
+            }
+            for f in request.files
+        ]
         
-        new_note = await process_snapshot(
+        res = await process_session_state(
             session_id=request.session_id,
             timestamp=request.timestamp,
             goal=request.goal or "",
@@ -263,28 +254,37 @@ async def save_session_snapshot(request: SnapshotRequest):
             api_key=request.api_key,
         )
         
-        return SnapshotResponse(success=True, new_note=new_note)
+        new_note = res.get("intent_summary") if res else None
+        return SessionStateResponse(success=True, new_note=new_note)
         
     except Exception as e:
-        logger.exception(f"Unexpected error saving snapshot for session {request.session_id}")
-        return SnapshotResponse(success=False, error=str(e))
+        logger.exception(f"Unexpected error saving session state for session {request.session_id}")
+        return SessionStateResponse(success=False, error=str(e))
 
 
 @router.get("/session/notes", response_model=NotesListResponse)
 async def get_session_notes(session_id: str):
     """
-    Retrieve all AI generated note versions for a specific session.
+    Retrieve all AI generated evolution notes for a specific session.
     """
     try:
-        logger.info(f"Retrieving note versions for session: {session_id}")
-        notes = get_note_versions(session_id)
+        logger.info(f"Retrieving evolution notes for session: {session_id}")
+        notes = get_evolution_notes(session_id)
         
         # Map to response objects
         note_items = [
             NoteVersionItem(
                 timestamp=note["timestamp"],
-                summary=note["summary"],
-                goal=note.get("goal")
+                summary=note["intent_summary"],  # backward compatibility
+                goal=note.get("goal"),
+                intent_summary=note["intent_summary"],
+                architecture_evolution=note["architecture_evolution"],
+                development_progression=note["development_progression"],
+                files_changed_count=note["files_changed_count"],
+                session_duration=note["session_duration"],
+                major_focus=note["major_focus"],
+                detected_patterns=note["detected_patterns"],
+                primary_language=note["primary_language"]
             )
             for note in notes
         ]

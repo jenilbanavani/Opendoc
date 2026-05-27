@@ -208,6 +208,57 @@ async def fetch_recent_commits(
     return commits
 
 
+def select_important_source_files(tree_paths: list[str]) -> list[str]:
+    """Identify up to 12 key code source files to fetch for technical signal extraction."""
+    from services.signal_extractor import SOURCE_EXTENSIONS
+    
+    ignored_patterns = [
+        r"(^|/)(?:node_modules|\.git|venv|\.venv|env|dist|build|out|bin|obj|target|test|tests|migrations|spec|docs|assets|images|public|static|__pycache__|\.vscode|\.idea|\.github|temp|tmp)(/|$)",
+        r"(?:test|spec|mock)\.[a-zA-Z0-9]+$"
+    ]
+    
+    source_files = []
+    for path in tree_paths:
+        if path.endswith("/"):
+            continue
+            
+        ignored = False
+        for pattern in ignored_patterns:
+            if re.search(pattern, path, re.IGNORECASE):
+                ignored = True
+                break
+        if ignored:
+            continue
+            
+        ext = "." + path.split(".")[-1].lower() if "." in path else ""
+        if ext in SOURCE_EXTENSIONS:
+            source_files.append(path)
+            
+    scored_files = []
+    for path in source_files:
+        basename = path.split("/")[-1].lower()
+        score = 0
+        
+        # Priority: Entry points
+        if basename in {"main.py", "app.py", "index.js", "index.ts", "server.js", "server.ts", "main.go", "main.rs", "app.js", "app.ts"}:
+            score += 100
+        elif any(k in basename for k in ["main", "app", "server", "index"]):
+            score += 50
+            
+        # Priority: routes, controllers, services, models
+        if any(k in path.lower() for k in ["router", "route", "controller", "service", "model", "api", "handler"]):
+            score += 30
+            
+        # Priority: core folders
+        if any(k in path.lower() for k in ["src/", "app/", "backend/", "lib/"]):
+            score += 10
+            
+        scored_files.append((score, path))
+        
+    scored_files.sort(key=lambda x: x[0], reverse=True)
+    return [path for _, path in scored_files[:12]]
+
+
 async def build_repo_context(repo_url: str) -> dict:
     """
     Main entry point — fetches everything and assembles a context dict
@@ -222,6 +273,8 @@ async def build_repo_context(repo_url: str) -> dict:
             "context_string": "..."   # The assembled text to send to AI
         }
     """
+    from services.signal_extractor import build_unified_context
+
     owner, repo = parse_github_url(repo_url)
 
     # Fetch metadata first to get the default branch
@@ -232,7 +285,7 @@ async def build_repo_context(repo_url: str) -> dict:
     tree_paths = await fetch_repo_tree(owner, repo, branch)
     commits = await fetch_recent_commits(owner, repo)
 
-    # Determine which key files exist in this repo
+    # Determine which key config/metadata files exist in this repo
     tree_set = set(tree_paths)
     files_to_fetch = [f for f in KEY_FILES if f in tree_set]
 
@@ -243,7 +296,13 @@ async def build_repo_context(repo_url: str) -> dict:
             files_to_fetch.append(path)
             break
 
-    # Fetch key file contents
+    # Also determine which key source files to fetch for signals extraction
+    important_sources = select_important_source_files(tree_paths)
+    for path in important_sources:
+        if path not in files_to_fetch:
+            files_to_fetch.append(path)
+
+    # Fetch all determined file contents
     key_files = {}
     for fpath in files_to_fetch:
         content = await fetch_file_content(owner, repo, fpath)
@@ -256,40 +315,14 @@ async def build_repo_context(repo_url: str) -> dict:
         tree_summary_lines.append(f"... and {len(tree_paths) - 200} more files")
     tree_summary = "\n".join(tree_summary_lines)
 
-    # Assemble the full context string
-    context_parts = []
-
-    context_parts.append("=== REPOSITORY METADATA ===")
-    context_parts.append(f"Name: {metadata['full_name']}")
-    context_parts.append(f"Description: {metadata['description']}")
-    context_parts.append(f"Primary Language: {metadata['language']}")
-    context_parts.append(f"Stars: {metadata['stars']} | Forks: {metadata['forks']}")
-    context_parts.append(f"Topics: {', '.join(metadata['topics'])}")
-    context_parts.append(f"License: {metadata['license']}")
-    context_parts.append(f"Created: {metadata['created_at']}")
-    context_parts.append(f"Last Updated: {metadata['updated_at']}")
-    context_parts.append("")
-
-    context_parts.append("=== FILE STRUCTURE (top entries) ===")
-    context_parts.append(tree_summary)
-    context_parts.append("")
-
-    for fname, content in key_files.items():
-        context_parts.append(f"=== FILE: {fname} ===")
-        context_parts.append(content)
-        context_parts.append("")
-
-    if commits:
-        context_parts.append("=== RECENT COMMITS ===")
-        for c in commits:
-            context_parts.append(f"[{c['sha']}] {c['message']} — {c['author']} ({c['date']})")
-        context_parts.append("")
-
-    context_string = "\n".join(context_parts)
-
-    # Trim if too long
-    if len(context_string) > MAX_TOTAL_CONTEXT_CHARS:
-        context_string = context_string[:MAX_TOTAL_CONTEXT_CHARS] + "\n\n[... context trimmed for token economy ...]"
+    # Extract signals and build the context string via unified service
+    context_string = build_unified_context(
+        project_name=metadata["full_name"],
+        folder_structure=tree_summary,
+        files=key_files,
+        recent_commits=commits,
+        metadata=metadata
+    )
 
     return {
         "metadata": metadata,

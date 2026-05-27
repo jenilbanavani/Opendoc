@@ -125,23 +125,8 @@ async def generate_report(
     user_prompt = build_user_prompt(context_string)
     raw_response = ""
 
-    # Resolve system prompt dynamically based on mode
+    # Always use the single strong system prompt
     system_prompt = SYSTEM_PROMPT
-    if report_mode == "client":
-        from prompts.client_prompt import SYSTEM_PROMPT as client_sp
-        system_prompt = client_sp
-    elif report_mode == "learning":
-        from prompts.learning_prompt import SYSTEM_PROMPT as learning_sp
-        system_prompt = learning_sp
-    elif report_mode == "understanding":
-        from prompts.understanding_prompt import SYSTEM_PROMPT as understanding_sp
-        system_prompt = understanding_sp
-    elif report_mode == "portfolio":
-        from prompts.portfolio_prompt import SYSTEM_PROMPT as portfolio_sp
-        system_prompt = portfolio_sp
-    elif report_mode == "custom":
-        from prompts.custom_prompt import build_custom_prompt
-        system_prompt = build_custom_prompt(custom_sections or [])
 
     try:
         if provider == "groq":
@@ -159,7 +144,7 @@ async def generate_report(
             raw_response = await _call_openai(client, model, system_prompt, user_prompt)
             
         elif provider == "anthropic":
-            key = api_key or settings.ANTHROPIC_API_KEY
+            key = api_key or settings.ANCHROPIC_API_KEY
             if not key: raise ValueError("No Anthropic API key provided.")
             from anthropic import AsyncAnthropic
             client = AsyncAnthropic(api_key=key)
@@ -181,12 +166,6 @@ async def generate_report(
         # Parse JSON response
         cleaned = _clean_json_response(raw_response)
         report_dict = json.loads(cleaned)
-
-        # For custom mode, filter out fields the user didn't select
-        if report_mode == "custom":
-            from prompts.custom_prompt import get_fields_for_sections
-            allowed = get_fields_for_sections(custom_sections or [])
-            report_dict = {k: v for k, v in report_dict.items() if k in allowed}
 
         # Build the report with all new fields
         report = ReportData(
