@@ -351,3 +351,109 @@ export function analyzeFileContent(
   };
 }
 
+export interface WorkspaceMetadata {
+  workspaceRoot: string;
+  projectName: string;
+  languages: string[];
+  git: {
+    isRepository: boolean;
+    isInstalled: boolean;
+  };
+}
+
+/**
+ * Automatically detects the current VS Code workspace metadata, including
+ * workspace root path, project name, detected programming languages, and Git status.
+ */
+export async function detectWorkspaceMetadata(): Promise<WorkspaceMetadata | null> {
+  const workspaceFolders = vscode.workspace.workspaceFolders;
+  if (!workspaceFolders || workspaceFolders.length === 0) {
+    return null;
+  }
+
+  const rootFolder = workspaceFolders[0];
+  const workspaceRoot = rootFolder.uri.fsPath;
+  const projectName = rootFolder.name;
+
+  // 1. Language Detection
+  const languages: string[] = [];
+  const langChecks = [
+    { name: "Python", pattern: "**/*.py" },
+    { name: "TypeScript", pattern: "**/*.{ts,tsx}" },
+    { name: "JavaScript", pattern: "**/*.{js,jsx}" },
+    { name: "Go", pattern: "**/*.go" },
+    { name: "Rust", pattern: "**/*.rs" },
+    { name: "Java", pattern: "**/*.java" },
+    { name: "C#", pattern: "**/*.cs" },
+    { name: "C/C++", pattern: "**/*.{c,cpp,h}" },
+    { name: "Ruby", pattern: "**/*.rb" },
+    { name: "PHP", pattern: "**/*.php" },
+    { name: "HTML", pattern: "**/*.html" },
+    { name: "CSS", pattern: "**/*.css" },
+  ];
+
+  try {
+    const checkPromises = langChecks.map(async (check) => {
+      const files = await vscode.workspace.findFiles(
+        check.pattern,
+        "**/{node_modules,venv,.venv,dist,build,out,.git}/**",
+        1
+      );
+      if (files.length > 0) {
+        languages.push(check.name);
+      }
+    });
+    await Promise.all(checkPromises);
+  } catch (err) {
+    console.error("Language detection error:", err);
+  }
+
+  // Sort languages alphabetically
+  languages.sort();
+
+  // 2. Git Availability Detection
+  let isRepository = false;
+  let isInstalled = false;
+
+  // Check .git directory presence
+  try {
+    const gitUri = vscode.Uri.joinPath(rootFolder.uri, ".git");
+    await vscode.workspace.fs.stat(gitUri);
+    isRepository = true;
+  } catch {
+    // If not found directly, check via vscode.git extension API below
+  }
+
+  // Check VS Code Git Extension status
+  try {
+    const gitExtension = vscode.extensions.getExtension("vscode.git");
+    if (gitExtension) {
+      if (!gitExtension.isActive) {
+        await gitExtension.activate();
+      }
+      const gitAPI = gitExtension.exports.getAPI(1);
+      if (gitAPI) {
+        isInstalled = true;
+        const repos = gitAPI.repositories;
+        const rootUriStr = rootFolder.uri.toString();
+        const hasRepo = repos.some((r: any) => r.rootUri.toString() === rootUriStr);
+        if (hasRepo) {
+          isRepository = true;
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Git detection error:", err);
+  }
+
+  return {
+    workspaceRoot,
+    projectName,
+    languages,
+    git: {
+      isRepository,
+      isInstalled,
+    },
+  };
+}
+

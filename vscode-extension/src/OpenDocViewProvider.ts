@@ -7,7 +7,8 @@
 
 import * as vscode from "vscode";
 import * as crypto from "crypto";
-import { getWorkspaceTree, readKeyFiles, analyzeFileContent } from "./utils/workspaceScanner";
+import * as path from "path";
+import { getWorkspaceTree, readKeyFiles, analyzeFileContent, detectWorkspaceMetadata } from "./utils/workspaceScanner";
 
 export class OpenDocViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "opendoc-sidebar";
@@ -223,6 +224,86 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async _sendWorkspaceMetadata(): Promise<void> {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+      return;
+    }
+    const rootFolder = workspaceFolders[0];
+    
+    // 1. Get workspace metadata
+    const metadata = await detectWorkspaceMetadata();
+    
+    // 2. Get top 3-4 files in the workspace
+    const filesList: { name: string; role: string }[] = [];
+    try {
+      const entries = await vscode.workspace.fs.readDirectory(rootFolder.uri);
+      const ignored = new Set(["node_modules", "dist", "build", ".git", "venv", ".venv"]);
+      const sourceExts = new Set([".py", ".ts", ".tsx", ".js", ".jsx"]);
+      
+      for (const [name, type] of entries) {
+        if (type === vscode.FileType.File) {
+          const ext = path.extname(name).toLowerCase();
+          if (sourceExts.has(ext) || name === "package.json" || name === "requirements.txt") {
+            let role = "config";
+            if (name === "main.py" || name === "index.ts" || name === "app.py") role = "entrypoint";
+            else if (name.includes("service")) role = "service";
+            else if (name.includes("route") || name.includes("controller")) role = "router";
+            filesList.push({ name, role });
+          }
+        } else if (type === vscode.FileType.Directory && !ignored.has(name) && !name.startsWith(".")) {
+          const subUri = vscode.Uri.joinPath(rootFolder.uri, name);
+          const subEntries = await vscode.workspace.fs.readDirectory(subUri);
+          for (const [sName, sType] of subEntries) {
+            if (sType === vscode.FileType.File) {
+              const ext = path.extname(sName).toLowerCase();
+              if (sourceExts.has(ext)) {
+                let role = "source";
+                if (sName.includes("service")) role = "service";
+                else if (sName.includes("route") || sName.includes("controller")) role = "router";
+                else if (sName.includes("schema") || sName.includes("model")) role = "model";
+                filesList.push({ name: `${name}/${sName}`, role });
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore
+    }
+
+    // Sort files list so that entrypoints/routers are first
+    const rolePriority: Record<string, number> = { entrypoint: 1, router: 2, service: 3, model: 4, source: 5, config: 6 };
+    filesList.sort((a, b) => (rolePriority[a.role] || 10) - (rolePriority[b.role] || 10));
+
+    const totalFilesCount = filesList.length;
+    const displayFiles = filesList.slice(0, 3);
+    const extraCount = totalFilesCount - displayFiles.length;
+
+    const focusAreas: string[] = [];
+    if (metadata?.languages.includes("Python")) {
+      focusAreas.push("FastAPI", "Python 3");
+    }
+    if (metadata?.languages.includes("TypeScript") || metadata?.languages.includes("JavaScript")) {
+      focusAreas.push("TypeScript", "Node.js");
+    }
+    focusAreas.push("LLM routing", "PDF export", "Pydantic schemas");
+    if (metadata?.git.isRepository) {
+      focusAreas.push("Git versioning");
+    }
+
+    this._postMessage({
+      command: "workspaceMetadata",
+      projectName: metadata?.projectName || rootFolder.name,
+      workspaceRoot: metadata?.workspaceRoot || rootFolder.uri.fsPath,
+      languages: metadata?.languages || [],
+      gitAvailable: metadata?.git.isRepository || false,
+      files: displayFiles,
+      extraCount: extraCount,
+      focusAreas: focusAreas
+    });
+  }
+
   private _trackFile(uri: vscode.Uri, action: "opened" | "edited") {
     // Only track workspace files
     const folder = vscode.workspace.getWorkspaceFolder(uri);
@@ -307,6 +388,9 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
           break;
         case "refreshNotes":
           await this._fetchNotesHistory();
+          break;
+        case "getWorkspaceMetadata":
+          await this._sendWorkspaceMetadata();
           break;
         case "recordSessionState":
           await this._sendSessionState(true);
@@ -668,170 +752,370 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css">
 <style>
-  /* ── Reset & Typography ── */
+  /* ── Sidebar Theme ── */
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   body {
-    font-family: 'Outfit', var(--vscode-font-family, 'Segoe UI', system-ui, sans-serif);
-    font-size: var(--vscode-font-size, 13px);
-    color: #1f2937;
-    background: radial-gradient(circle at 10% 20%, #f9fafb 0%, #f3f4f6 40%, #e5e7eb 70%, #d1d5db 100%);
-    background-attachment: fixed;
-    line-height: 1.5;
-    padding: 0;
+    font-family: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+    color: #ccc;
+    background: #1e1e1e;
     overflow-x: hidden;
   }
 
-  /* ── Header (Glassmorphism) ── */
-  .header {
-    padding: 20px 16px 16px;
-    border-bottom: 1px solid rgba(0, 0, 0, 0.06);
-    background: rgba(255, 255, 255, 0.5);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
+  .sidebar {
+    background: #1e1e1e;
+    color: #ccc;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
   }
 
-  .header-top {
+  .sidebar-header {
+    background: #252526;
+    padding: 10px 14px;
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    margin-bottom: 10px;
+    gap: 8px;
+    border-bottom: 1px solid #333;
+    flex-shrink: 0;
   }
 
-  .logo {
+  .sidebar-header span {
+    font-size: 11px;
+    font-weight: 600;
+    color: #ccc;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+  }
+
+  .sidebar-body {
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    overflow-y: auto;
+    flex: 1;
+  }
+
+  .section-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: #858585;
+    margin-bottom: 6px;
+    font-weight: 700;
+  }
+
+  .report-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+  }
+
+  .report-card {
+    background: #2d2d2d;
+    border: 1px solid #3a3a3a;
+    border-radius: 8px;
+    padding: 10px;
+    cursor: pointer;
+    transition: all .2s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .report-card:hover {
+    border-color: #555;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  }
+
+  .report-card.selected {
+    border-color: #7c5cbf;
+    background: #2a2040;
+    box-shadow: 0 4px 12px rgba(124, 92, 191, 0.15);
+  }
+
+  .report-card .rc-icon {
+    font-size: 18px;
+    margin-bottom: 6px;
+    color: #888;
+  }
+
+  .report-card.selected .rc-icon {
+    color: #a78bfa;
+  }
+
+  .report-card .rc-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: #ddd;
+  }
+
+  .report-card.selected .rc-title {
+    color: #c4b5fd;
+  }
+
+  .report-card .rc-desc {
+    font-size: 10px;
+    color: #777;
+    margin-top: 4px;
+    line-height: 1.4;
+  }
+
+  .report-card.selected .rc-desc {
+    color: #9d91db;
+  }
+
+  .file-list {
+    background: #252526;
+    border-radius: 8px;
+    border: 1px solid #333;
+    overflow: hidden;
+  }
+
+  .file-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid #2a2a2a;
+    transition: background-color 0.2s;
+  }
+  
+  .file-row:hover {
+    background: rgba(255,255,255,0.02);
+  }
+
+  .file-row:last-child {
+    border-bottom: none;
+  }
+
+  .file-row .file-icon {
+    font-size: 14px;
+    color: #569cd6;
+  }
+
+  .file-row .file-name {
+    font-size: 12px;
+    color: #9cdcfe;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .file-row .file-role {
+    font-size: 9px;
+    color: #4ec9b0;
+    background: #1e3330;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+
+  .badge-row {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .badge {
+    font-size: 10px;
+    padding: 3px 8px;
+    border-radius: 12px;
+    font-weight: 500;
+  }
+
+  .badge-purple { background: #2a2040; color: #a78bfa; border: 1px solid #4c3880; }
+  .badge-teal { background: #1a2e2a; color: #4ec9b0; border: 1px solid #2a4a44; }
+  .badge-amber { background: #2a2010; color: #ce9178; border: 1px solid #4a3820; }
+  .badge-lang { background: #1a2e2a; color: #4ec9b0; border: 1px solid #2a4a44; }
+  .badge-files { background: #2a2010; color: #ce9178; border: 1px solid #4a3820; }
+  .badge-duration { background: #1c2536; color: #569cd6; border: 1px solid #2b3c5a; }
+  .badge-focus { background: #2a2040; color: #a78bfa; border: 1px solid #4c3880; }
+  .badge-pattern { background: #2d2d2d; color: #bbb; border: 1px solid #3d3d3d; }
+
+  /* ── Action Buttons ── */
+  .gen-btn {
+    background: #7c5cbf;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    width: 100%;
+    cursor: pointer;
+    letter-spacing: .02em;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    box-shadow: 0 4px 10px rgba(124, 92, 191, 0.2);
+  }
+
+  .gen-btn:hover {
+    background: #6a4daa;
+    transform: translateY(-1px);
+    box-shadow: 0 6px 14px rgba(124, 92, 191, 0.3);
+  }
+  
+  .gen-btn:active {
+    transform: translateY(0);
+  }
+
+  .gen-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none !important;
+    box-shadow: none !important;
+  }
+
+  .secondary-btn {
+    background: #2d2d2d;
+    color: #ccc;
+    border: 1px solid #3a3a3a;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+
+  .secondary-btn:hover {
+    background: #353535;
+    border-color: #4a4a4a;
+    color: #fff;
+  }
+
+  .secondary-btn:active {
+    transform: scale(0.98);
+  }
+
+  .secondary-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  /* ── Depth Selector ── */
+  .depth-row {
     display: flex;
     align-items: center;
     gap: 8px;
   }
 
-  .logo-icon {
-    width: 24px;
-    height: 24px;
-    border-radius: 8px;
-    background: #18181b;
+  .depth-row label {
+    font-size: 11px;
+    color: #888;
+    flex: 1;
+    font-weight: 600;
+  }
+
+  .toggle {
     display: flex;
+    background: #2d2d2d;
+    border: 1px solid #3a3a3a;
+    border-radius: 6px;
+    overflow: hidden;
+  }
+
+  .toggle span {
+    font-size: 10px;
+    padding: 5px 12px;
+    cursor: pointer;
+    color: #777;
+    transition: all 0.2s;
+    font-weight: 600;
+    user-select: none;
+  }
+
+  .toggle span:hover {
+    color: #ccc;
+  }
+
+  .toggle span.on {
+    background: #3a2d5c;
+    color: #a78bfa;
+  }
+
+  .divider {
+    border: none;
+    border-top: 1px solid #2d2d2d;
+    margin: 4px 0;
+  }
+
+  /* ── Input ── */
+  .goal-input {
+    width: 100%;
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid #3a3a3a;
+    background: #252526;
+    color: #ccc;
+    font-family: inherit;
+    font-size: 12px;
+    outline: none;
+    transition: all 0.2s;
+  }
+
+  .goal-input:focus {
+    border-color: #7c5cbf;
+    box-shadow: 0 0 0 1px rgba(124, 92, 191, 0.4);
+  }
+
+  /* ── Header Badge ── */
+  .workspace-badge {
+    font-size: 10px;
+    font-weight: 600;
+    color: #858585;
+    display: inline-flex;
     align-items: center;
-    justify-content: center;
-    font-size: 13px;
-    color: #ffffff;
-    font-weight: 800;
-    flex-shrink: 0;
-    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+    gap: 6px;
+    background: #1e1e1e;
+    border: 1px solid #333;
+    padding: 3px 8px;
+    border-radius: 20px;
   }
 
-  .logo-text {
-    font-size: 16px;
-    font-weight: 800;
-    color: #18181b;
-    letter-spacing: -0.5px;
+  .workspace-badge .dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: #10b981;
+    box-shadow: 0 0 6px #10b981;
   }
 
+  /* ── Settings icon ── */
   .settings-btn {
     background: none;
     border: none;
-    color: #4b5563;
+    color: #858585;
     cursor: pointer;
-    font-size: 16px;
-    padding: 6px;
-    border-radius: 8px;
+    font-size: 14px;
+    padding: 4px;
+    border-radius: 4px;
     transition: all 0.2s;
     line-height: 1;
     display: flex;
     align-items: center;
     justify-content: center;
   }
+
   .settings-btn:hover {
-    color: #18181b;
-    background: rgba(0, 0, 0, 0.05);
-    transform: rotate(30deg);
+    color: #fff;
+    background: #2d2d2d;
   }
 
-  .workspace-badge {
-    font-size: 11px;
-    font-weight: 500;
-    color: #4b5563;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    background: rgba(0, 0, 0, 0.05);
-    border: 1px solid rgba(0, 0, 0, 0.04);
-    padding: 4px 10px;
-    border-radius: 20px;
-  }
-  .workspace-badge .dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: #10b981;
-    box-shadow: 0 0 8px #10b981;
-    flex-shrink: 0;
-  }
-
-  /* ── Action Buttons ── */
-  .action-area {
-    padding: 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  .analyze-btn, .devnotes-btn {
-    width: 100%;
-    padding: 12px 16px;
-    border: none;
-    border-radius: 14px;
-    font-size: 13px;
-    font-weight: 600;
-    font-family: 'Outfit', sans-serif;
-    cursor: pointer;
-    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
-  }
-
-  /* Dark Button style */
-  .analyze-btn {
-    background: #18181b;
-    color: #ffffff;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-  }
-  .analyze-btn:hover {
-    background: #27272a;
-    transform: translateY(-1px);
-    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
-  }
-
-  /* Light Button style */
-  .devnotes-btn {
-    background: #ffffff;
-    color: #18181b;
-    border: 1px solid rgba(0, 0, 0, 0.08);
-  }
-  .devnotes-btn:hover {
-    background: #f9fafb;
-    transform: translateY(-1px);
-    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -4px rgba(0, 0, 0, 0.05);
-  }
-
-  .analyze-btn:active, .devnotes-btn:active {
-    transform: translateY(0) scale(0.98);
-  }
-
-  .analyze-btn:disabled, .devnotes-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-    transform: none !important;
-    box-shadow: none !important;
-  }
-
-  /* ── Status ── */
+  /* ── Status Area ── */
   .status {
-    padding: 0 16px;
-    margin-bottom: 16px;
+    padding: 4px 0;
   }
 
   .status-msg {
@@ -840,26 +1124,25 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
     gap: 8px;
     font-size: 12px;
     font-weight: 500;
-    padding: 10px 14px;
-    border-radius: 12px;
-    animation: fadeIn 0.2s ease;
+    padding: 8px 12px;
+    border-radius: 6px;
   }
 
   .status-msg.loading {
-    color: #1d4ed8;
+    color: #3b82f6;
     background: rgba(59, 130, 246, 0.1);
     border: 1px solid rgba(59, 130, 246, 0.2);
   }
 
   .status-msg.error {
-    color: #dc2626;
+    color: #ef4444;
     background: rgba(239, 68, 68, 0.1);
     border: 1px solid rgba(239, 68, 68, 0.2);
   }
 
   .spinner {
-    width: 14px;
-    height: 14px;
+    width: 12px;
+    height: 12px;
     border: 2px solid transparent;
     border-top-color: currentColor;
     border-radius: 50%;
@@ -868,422 +1151,339 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
   }
 
   @keyframes spin { to { transform: rotate(360deg); } }
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
-  /* ── Report Cards / Widgets ── */
+  /* ── Report Card output ── */
   .report {
-    padding: 0 16px 32px;
+    background: #252526;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 12px;
+    margin-top: 10px;
     animation: fadeIn 0.3s ease;
   }
 
   .report-header {
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 700;
-    color: #18181b;
-    margin-bottom: 16px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid rgba(0, 0, 0, 0.06);
-    letter-spacing: -0.2px;
-  }
-
-  /* Alternating Dark / Light Widget styles mimicking the Dribbble design */
-  .report-section {
+    color: #fff;
     margin-bottom: 12px;
-    border-radius: 20px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #2d2d2d;
+  }
+
+  .report-section {
+    margin-bottom: 8px;
+    border-radius: 6px;
+    border: 1px solid #3a3a3a;
+    background: #2d2d2d;
     overflow: hidden;
-    transition: all 0.25s ease;
-  }
-
-  /* Dark Card (charcoal theme) */
-  .report-section.dark-card {
-    background: #18181b;
-    color: #f4f4f5;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
-  }
-  .report-section.dark-card:hover {
-    border-color: rgba(255, 255, 255, 0.15);
-    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.15), 0 8px 10px -6px rgba(0, 0, 0, 0.15);
-  }
-
-  /* Light Card (clean white theme) */
-  .report-section.light-card {
-    background: #ffffff;
-    color: #18181b;
-    border: 1px solid rgba(0, 0, 0, 0.06);
-    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.04), 0 4px 6px -4px rgba(0, 0, 0, 0.04);
-  }
-  .report-section.light-card:hover {
-    border-color: rgba(0, 0, 0, 0.12);
-    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.08), 0 8px 10px -6px rgba(0, 0, 0, 0.08);
   }
 
   .section-toggle {
     width: 100%;
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 14px 16px;
+    gap: 8px;
+    padding: 10px 12px;
     border: none;
     cursor: pointer;
     text-align: left;
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 600;
-    font-family: 'Outfit', sans-serif;
-    transition: background-color 0.2s;
     background: transparent;
-    color: inherit;
+    color: #ddd;
+    transition: background 0.2s;
   }
 
-  .report-section.dark-card .section-toggle:hover {
-    background: rgba(255, 255, 255, 0.04);
-  }
-  .report-section.light-card .section-toggle:hover {
-    background: rgba(0, 0, 0, 0.02);
+  .section-toggle:hover {
+    background: rgba(255,255,255,0.02);
   }
 
   .section-toggle .chevron {
-    font-size: 9px;
+    font-size: 8px;
     transition: transform 0.2s ease;
-    flex-shrink: 0;
-    opacity: 0.6;
+    opacity: 0.5;
   }
+
   .section-toggle.open .chevron {
     transform: rotate(90deg);
   }
 
   .section-content {
     display: none;
-    padding: 0 16px 16px;
-    font-size: 12px;
-    line-height: 1.6;
+    padding: 10px 12px;
+    font-size: 11px;
+    line-height: 1.5;
+    color: #b5b5b5;
+    border-top: 1px solid #252526;
   }
+
   .section-content.open {
     display: block;
   }
 
-  .report-section.dark-card .section-content {
-    color: #a1a1aa;
-    border-top: 1px solid rgba(255, 255, 255, 0.06);
-    padding-top: 12px;
-  }
-  .report-section.light-card .section-content {
-    color: #4b5563;
-    border-top: 1px solid rgba(0, 0, 0, 0.05);
-    padding-top: 12px;
-  }
-
-  /* List Bullet styles matching card themes */
   .section-content ul {
-    padding-left: 18px;
-    margin: 6px 0;
-  }
-  .section-content li {
-    margin-bottom: 6px;
-  }
-  .report-section.dark-card li::marker {
-    color: #ffffff;
-  }
-  .report-section.light-card li::marker {
-    color: #18181b;
+    padding-left: 16px;
+    margin: 4px 0;
   }
 
-  .sub-field {
-    margin-bottom: 12px;
+  .section-content li {
+    margin-bottom: 4px;
   }
+  
+  .sub-field {
+    margin-bottom: 10px;
+  }
+  
   .sub-field-label {
-    font-size: 10px;
+    font-size: 9px;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.8px;
-    margin-bottom: 3px;
-  }
-  .report-section.dark-card .sub-field-label {
-    color: #a1a1aa;
-  }
-  .report-section.light-card .sub-field-label {
-    color: #6b7280;
+    color: #858585;
+    margin-bottom: 2px;
   }
 
-  /* ── Scrollbar ── */
-  ::-webkit-scrollbar { width: 6px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb {
-    background: rgba(0, 0, 0, 0.15);
-    border-radius: 3px;
-  }
-  ::-webkit-scrollbar-thumb:hover {
-    background: rgba(0, 0, 0, 0.25);
-  }
-
-  /* ── Report Mode Selection System ── */
-  .mode-select-container {
-    padding: 0 16px;
-    margin-bottom: 12px;
-  }
-  .mode-select {
-    width: 100%;
-    padding: 10px 14px;
-    border-radius: 14px;
-    border: 1px solid rgba(0, 0, 0, 0.08);
-    background: #ffffff;
-    font-family: 'Outfit', sans-serif;
-    font-size: 12px;
-    font-weight: 500;
-    color: #18181b;
-    outline: none;
-    cursor: pointer;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.02);
-    transition: all 0.2s;
-  }
-  .mode-select:focus {
-    border-color: #18181b;
-    box-shadow: 0 0 0 2px rgba(24, 24, 27, 0.08);
-  }
-
-  .custom-sections {
-    padding: 12px 16px;
-    background: rgba(255, 255, 255, 0.4);
-    border-radius: 18px;
-    border: 1px solid rgba(0, 0, 0, 0.05);
-    margin: 0 16px 14px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    animation: fadeIn 0.25s ease;
-  }
-
-  .checkbox-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 11px;
-    font-weight: 600;
-    color: #4b5563;
-    cursor: pointer;
-  }
-  .checkbox-item input {
-    cursor: pointer;
-    accent-color: #18181b;
-    width: 13px;
-    height: 13px;
-  }
-
-  /* ── Export panel style ── */
+  /* ── Export actions ── */
   .export-panel {
-    padding: 16px;
     display: flex;
-    gap: 10px;
-    background: rgba(255, 255, 255, 0.4);
-    border-top: 1px solid rgba(0, 0, 0, 0.06);
-    margin-top: 24px;
-    animation: fadeIn 0.3s ease;
+    gap: 8px;
+    margin-top: 8px;
   }
+
   .export-btn {
     flex: 1;
-    padding: 10px 14px;
-    border-radius: 12px;
-    border: 1px solid rgba(0, 0, 0, 0.08);
-    background: #ffffff;
-    color: #18181b;
-    font-family: 'Outfit', sans-serif;
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid #3a3a3a;
+    background: #2d2d2d;
+    color: #ccc;
     font-size: 11px;
     font-weight: 600;
     cursor: pointer;
     transition: all 0.2s;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.02);
   }
+
   .export-btn:hover {
-    background: #f9fafb;
-    transform: translateY(-1px);
-    box-shadow: 0 6px 12px rgba(0,0,0,0.05);
-  }
-  .export-btn:active {
-    transform: translateY(0);
+    background: #353535;
+    color: #fff;
   }
 
-  .hidden { display: none !important; }
-
-  /* ── Note Version History ── */
+  /* ── Evolution History ── */
   .history-list {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    margin-top: 4px;
+    gap: 6px;
     max-height: 250px;
     overflow-y: auto;
-    padding-right: 4px;
   }
+
   .history-item {
-    background: #ffffff;
-    border: 1px solid rgba(0, 0, 0, 0.06);
-    border-radius: 12px;
-    padding: 10px 12px;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.01);
-    transition: all 0.2s ease;
-    animation: fadeIn 0.2s ease;
+    background: #252526;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 10px;
+    transition: all 0.2s;
   }
+
   .history-item:hover {
-    border-color: rgba(0, 0, 0, 0.1);
-    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.03);
+    border-color: #444;
   }
+
   .history-item-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 4px;
-    gap: 6px;
+    margin-bottom: 6px;
   }
+
   .history-item-time {
     font-size: 9px;
     font-weight: 700;
-    color: #2563eb;
-    background: rgba(37, 99, 235, 0.08);
+    color: #a78bfa;
+    background: rgba(167, 139, 250, 0.1);
     padding: 2px 6px;
-    border-radius: 20px;
-    white-space: nowrap;
+    border-radius: 10px;
   }
+
   .history-item-goal {
     font-size: 9px;
     font-weight: 600;
-    color: #4b5563;
-    background: rgba(0, 0, 0, 0.04);
+    color: #858585;
+    background: #1e1e1e;
     padding: 2px 6px;
-    border-radius: 20px;
+    border-radius: 10px;
     max-width: 60%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+
   .history-item-summary {
     font-size: 11px;
+    color: #ccc;
     line-height: 1.4;
-    color: #1f2937;
   }
+
   .history-empty {
     font-size: 11px;
-    color: #6b7280;
+    color: #666;
     text-align: center;
     padding: 16px;
-    border: 1px dashed rgba(0, 0, 0, 0.08);
-    border-radius: 12px;
-    background: rgba(0, 0, 0, 0.005);
+    border: 1px dashed #333;
+    border-radius: 8px;
   }
+
   .history-item-badges {
     display: flex;
     flex-wrap: wrap;
     gap: 4px;
     margin-top: 6px;
   }
-  .badge {
-    font-size: 9px;
-    font-weight: 500;
-    padding: 1px 6px;
-    border-radius: 4px;
-    white-space: nowrap;
-  }
-  .badge-lang {
-    background: rgba(16, 185, 129, 0.1);
-    color: #047857;
-    border: 1px solid rgba(16, 185, 129, 0.15);
-  }
-  .badge-files {
-    background: rgba(245, 158, 11, 0.1);
-    color: #b45309;
-    border: 1px solid rgba(245, 158, 11, 0.15);
-  }
-  .badge-duration {
-    background: rgba(99, 102, 241, 0.1);
-    color: #4f46e5;
-    border: 1px solid rgba(99, 102, 241, 0.15);
-  }
-  .badge-focus {
-    background: rgba(239, 68, 68, 0.1);
-    color: #b91c1c;
-    border: 1px solid rgba(239, 68, 68, 0.15);
-  }
-  .badge-pattern {
-    background: rgba(107, 114, 128, 0.1);
-    color: #374151;
-    border: 1px solid rgba(107, 114, 128, 0.15);
-  }
+
   .history-item-details {
     margin-top: 6px;
     padding-top: 6px;
-    border-top: 1px dashed rgba(0, 0, 0, 0.05);
-    font-size: 10px;
-    color: #4b5563;
+    border-top: 1px dashed #2d2d2d;
+    font-size: 9px;
+    color: #858585;
     display: flex;
     flex-direction: column;
     gap: 4px;
   }
-  .detail-section {
-    line-height: 1.3;
+
+  .hidden { display: none !important; }
+
+  /* ── Scrollbar ── */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: #333;
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #444;
   }
 </style>
 </head>
 <body>
 
-<!-- Header -->
-<div class="header">
-  <div class="header-top">
-    <div class="logo">
-      <div class="logo-icon">O</div>
-      <span class="logo-text">OpenDoc</span>
+<div class="sidebar">
+  <!-- Header -->
+  <div class="sidebar-header">
+    <i class="ti ti-brain" style="font-size:15px; color:#a78bfa"></i>
+    <span>OpenDoc</span>
+    <div class="workspace-badge" style="margin-left: 8px;">
+      <span class="dot"></span>
+      <span id="workspaceName">${this._escapeHtml(workspaceName)}</span>
     </div>
-    <div style="display: flex; gap: 4px;">
-      <button class="settings-btn" id="newSessionBtn" title="Start New Session">🆕</button>
-      <button class="settings-btn" id="settingsBtn" title="Settings">⚙️</button>
+    <div style="display: flex; gap: 4px; margin-left: auto;">
+      <button class="settings-btn" id="newSessionBtn" title="Start New Session"><i class="ti ti-rotate"></i></button>
+      <button class="settings-btn" id="settingsBtn" title="Settings"><i class="ti ti-settings"></i></button>
     </div>
   </div>
-  <div class="workspace-badge">
-    <span class="dot"></span>
-    <span id="workspaceName">${this._escapeHtml(workspaceName)}</span>
+
+  <!-- Body -->
+  <div class="sidebar-body">
+    <!-- Select report type -->
+    <div>
+      <div class="section-label">Select report type</div>
+      <div class="report-grid">
+        <div class="report-card selected" id="rc-learn" data-mode="learning">
+          <div class="rc-icon"><i class="ti ti-school"></i></div>
+          <div class="rc-title">Learning</div>
+          <div class="rc-desc">Understand what each file does &amp; why</div>
+        </div>
+        <div class="report-card" id="rc-client" data-mode="client">
+          <div class="rc-icon"><i class="ti ti-briefcase"></i></div>
+          <div class="rc-title">Client</div>
+          <div class="rc-desc">Non-technical overview for stakeholders</div>
+        </div>
+        <div class="report-card" id="rc-overview" data-mode="overview">
+          <div class="rc-icon"><i class="ti ti-layout-grid"></i></div>
+          <div class="rc-title">Overview</div>
+          <div class="rc-desc">Quick snapshot of structure &amp; stack</div>
+        </div>
+        <div class="report-card" id="rc-arch" data-mode="architecture">
+          <div class="rc-icon"><i class="ti ti-sitemap"></i></div>
+          <div class="rc-title">Architecture</div>
+          <div class="rc-desc">Patterns, decisions, trade-offs</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Current Goal -->
+    <div>
+      <div class="section-label">Current Goal</div>
+      <input type="text" id="currentGoal" class="goal-input" placeholder="e.g. Add authentication middleware">
+    </div>
+
+    <hr class="divider">
+
+    <!-- Files in scope -->
+    <div>
+      <div class="section-label">Files in scope</div>
+      <div class="file-list" id="filesScopeList">
+        <div class="file-row" style="opacity: 0.5; padding: 12px; justify-content: center;">
+          <span style="font-size: 11px;">Scanning workspace...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Explanation Depth -->
+    <div class="depth-row">
+      <label>Explanation depth</label>
+      <div class="toggle" id="depthToggle">
+        <span data-depth="Brief">Brief</span>
+        <span class="on" data-depth="Detailed">Detailed</span>
+        <span data-depth="Expert">Expert</span>
+      </div>
+    </div>
+
+    <!-- Detected focus areas -->
+    <div>
+      <div class="section-label">Detected focus areas</div>
+      <div class="badge-row" id="focusAreasList">
+        <span class="badge badge-purple">Detecting...</span>
+      </div>
+    </div>
+
+    <!-- Main actions -->
+    <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 4px;">
+      <button class="gen-btn" id="analyzeBtn">⚡ Generate learning report</button>
+      <div style="display: flex; gap: 6px;">
+        <button class="secondary-btn" id="devNotesBtn" style="flex: 1;"><i class="ti ti-notes"></i> Dev Notes</button>
+        <button class="secondary-btn" id="recordStateBtn" style="flex: 1;"><i class="ti ti-device-floppy"></i> Capture State</button>
+      </div>
+    </div>
+
+    <!-- Status loading/error -->
+    <div class="status hidden" id="statusArea">
+      <div class="status-msg" id="statusMsg"></div>
+    </div>
+
+    <!-- Report Output Area -->
+    <div class="report hidden" id="reportArea"></div>
+
+    <!-- Export Actions Panel -->
+    <div class="export-panel hidden" id="exportPanel">
+      <button class="export-btn" id="savePdfBtn"><i class="ti ti-file-type-pdf"></i> Save PDF</button>
+      <button class="export-btn" id="saveMDBtn"><i class="ti ti-markdown"></i> Save Markdown</button>
+    </div>
+
+    <!-- Session Evolution History -->
+    <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 4px; border-top: 1px solid #2d2d2d; padding-top: 12px;">
+      <div style="display: flex; align-items: center; justify-content: space-between;">
+        <span class="section-label" style="margin-bottom: 0;">Session Evolution History</span>
+        <button class="settings-btn" id="refreshNotesBtn" title="Refresh Notes" style="font-size: 12px; padding: 2px;"><i class="ti ti-refresh"></i></button>
+      </div>
+      <div id="notesHistoryList" class="history-list">
+        <div class="history-empty">No evolution states recorded yet. Save changes to trigger an update.</div>
+      </div>
+    </div>
+
   </div>
 </div>
-
-
-<!-- Action Area -->
-<div class="action-area">
-  <div style="display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px;">
-    <span style="font-size: 10px; font-weight: 700; text-transform: uppercase; color: #4b5563; letter-spacing: 0.5px; padding-left: 2px;">Current Goal</span>
-    <input type="text" id="currentGoal" class="mode-select" placeholder="Optional: e.g. Add authentication middleware" style="width: 100%;">
-  </div>
-
-  <button class="analyze-btn" id="analyzeBtn">⚡ Analyze Project</button>
-  <button class="devnotes-btn" id="devNotesBtn">📝 Generate Dev Notes</button>
-  <button class="devnotes-btn" id="recordStateBtn" style="margin-top: 4px;">💾 Capture Evolution State</button>
-</div>
-
-<!-- Status Area -->
-<div class="status hidden" id="statusArea">
-  <div class="status-msg" id="statusMsg"></div>
-</div>
-
-<!-- Report/Notes Area -->
-<div class="report hidden" id="reportArea"></div>
-
-<!-- Export Actions Panel -->
-<div class="export-panel hidden" id="exportPanel">
-  <button class="export-btn" id="savePdfBtn">📄 Save PDF</button>
-  <button class="export-btn" id="saveMDBtn">📝 Save Markdown</button>
-</div>
-
-<!-- Session Evolution History -->
-<div class="version-history-section" style="padding: 16px; border-top: 1px solid rgba(0, 0, 0, 0.06); margin-top: 10px; display: flex; flex-direction: column; gap: 10px;">
-  <div style="display: flex; align-items: center; justify-content: space-between;">
-    <span style="font-size: 10px; font-weight: 700; text-transform: uppercase; color: #4b5563; letter-spacing: 0.5px; padding-left: 2px;">Session Evolution History</span>
-    <button class="settings-btn" id="refreshNotesBtn" title="Refresh Notes" style="font-size: 12px; padding: 2px;">🔄</button>
-  </div>
-  <div id="notesHistoryList" class="history-list">
-    <div class="history-empty">No evolution states recorded yet. Save changes to trigger an update.</div>
-  </div>
-</div>
-
 
 <script>
 (function() {
@@ -1302,13 +1502,48 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
   const currentGoalInput = document.getElementById('currentGoal');
   const refreshNotesBtn = document.getElementById('refreshNotesBtn');
   const notesHistoryList = document.getElementById('notesHistoryList');
+  const filesScopeList = document.getElementById('filesScopeList');
+  const focusAreasList = document.getElementById('focusAreasList');
+  const depthToggle = document.getElementById('depthToggle');
 
   let currentReport = null;
+  let selectedReportMode = 'learning';
+  let selectedDepth = 'Detailed';
+
+  // Toggle report type selection
+  ['rc-learn', 'rc-client', 'rc-overview', 'rc-arch'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.addEventListener('click', () => {
+        document.querySelectorAll('.report-card').forEach(c => c.classList.remove('selected'));
+        el.classList.add('selected');
+        
+        selectedReportMode = el.getAttribute('data-mode');
+        const titles = {
+          'rc-learn': 'learning',
+          'rc-client': 'client',
+          'rc-overview': 'overview',
+          'rc-arch': 'architecture'
+        };
+        analyzeBtn.innerHTML = '⚡ Generate ' + titles[id] + ' report';
+      });
+    }
+  });
+
+  // Toggle explanation depth
+  depthToggle.querySelectorAll('span').forEach(span => {
+    span.addEventListener('click', () => {
+      depthToggle.querySelectorAll('span').forEach(s => s.classList.remove('on'));
+      span.classList.add('on');
+      selectedDepth = span.getAttribute('data-depth');
+    });
+  });
 
   analyzeBtn.addEventListener('click', () => {
     vscode.postMessage({
       command: 'analyze',
-      reportMode: 'client',
+      reportMode: selectedReportMode,
+      explanationDepth: selectedDepth,
       customSections: []
     });
 
@@ -1342,6 +1577,7 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
   settingsBtn.addEventListener('click', () => {
     vscode.postMessage({ command: 'openSettings' });
   });
+
   savePdfBtn.addEventListener('click', () => {
     if (currentReport) {
       vscode.postMessage({ command: 'savePdf', report: currentReport });
@@ -1382,7 +1618,7 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
       case 'error':
         statusArea.classList.remove('hidden');
         statusMsg.className = 'status-msg error';
-        statusMsg.innerHTML = '⚠ ' + escapeHtml(msg.text);
+        statusMsg.innerHTML = '⚠️ ' + escapeHtml(msg.text);
         analyzeBtn.disabled = false;
         devNotesBtn.disabled = false;
         recordStateBtn.disabled = false;
@@ -1416,8 +1652,50 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
       case 'clearGoal':
         currentGoalInput.value = '';
         break;
+
+      case 'workspaceMetadata':
+        updateWorkspaceMetadata(msg);
+        break;
     }
   });
+
+  function updateWorkspaceMetadata(data) {
+    if (data.projectName) {
+      document.getElementById('workspaceName').textContent = data.projectName;
+    }
+    
+    // Render Files in Scope
+    if (data.files && data.files.length > 0) {
+      let filesHtml = data.files.map(f => {
+        return '<div class="file-row">'
+          + '<i class="ti ti-file-code file-icon"></i>'
+          + '<span class="file-name" title="' + escapeHtml(f.name) + '">' + escapeHtml(f.name) + '</span>'
+          + '<span class="file-role">' + escapeHtml(f.role) + '</span>'
+          + '</div>';
+      }).join('');
+
+      if (data.extraCount > 0) {
+        filesHtml += '<div class="file-row" style="opacity: 0.5;">'
+          + '<i class="ti ti-dots file-icon" style="color: #555;"></i>'
+          + '<span class="file-name" style="color: #666;">+' + data.extraCount + ' more files</span>'
+          + '</div>';
+      }
+      filesScopeList.innerHTML = filesHtml;
+    } else {
+      filesScopeList.innerHTML = '<div class="file-row" style="padding: 12px; justify-content: center;"><span style="font-size: 11px; color: #666;">No files detected</span></div>';
+    }
+
+    // Render Focus Areas
+    if (data.focusAreas && data.focusAreas.length > 0) {
+      const badgeClasses = ['badge-purple', 'badge-teal', 'badge-amber'];
+      focusAreasList.innerHTML = data.focusAreas.map((area, index) => {
+        const cls = badgeClasses[index % badgeClasses.length];
+        return '<span class="badge ' + cls + '">' + escapeHtml(area) + '</span>';
+      }).join('');
+    } else {
+      focusAreasList.innerHTML = '<span class="badge badge-pattern">None detected</span>';
+    }
+  }
 
   function renderReport(r) {
     // 1. Group: Project Review
@@ -1431,7 +1709,7 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
     if (r.project_maturity || r.scope_vs_execution) {
       let maturityHtml = '';
       if (r.project_maturity) {
-        maturityHtml += '<div class="sub-field"><div class="sub-field-label">Project Maturity</div><div style="font-weight: 700; font-size: 13px; color: #10b981;">' + escapeHtml(r.project_maturity) + '</div></div>';
+        maturityHtml += '<div class="sub-field"><div class="sub-field-label">Project Maturity</div><div style="font-weight: 700; font-size: 12px; color: #10b981;">' + escapeHtml(r.project_maturity) + '</div></div>';
       }
       if (r.scope_vs_execution) {
         maturityHtml += '<div class="sub-field"><div class="sub-field-label">Scope vs Execution</div><p>' + escapeHtml(r.scope_vs_execution) + '</p></div>';
@@ -1490,10 +1768,10 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
       learningSections.push({ title: '📁 Portfolio & Resume Assessment', content: p(r.portfolio_assessment), dark: false });
 
     if (r.developer_intelligence)
-      learningSections.push({ title: '🧠 Developer Intelligence Insights', content: p(r.developer_intelligence), dark: true });
+      reviewSections.push({ title: '🧠 Developer Intelligence Insights', content: p(r.developer_intelligence), dark: true });
 
     if (r.final_verdict)
-      learningSections.push({ title: '⚡ Final Review Verdict', content: p(r.final_verdict), open: true, dark: true });
+      reviewSections.push({ title: '⚡ Final Review Verdict', content: p(r.final_verdict), open: true, dark: true });
 
     // Render grouped dashboard widgets with sub-headings
     let html = '<div class="report-header">Intelligence Dashboard — ' + escapeHtml(r.repo_name || 'Project') + '</div>';
@@ -1501,13 +1779,12 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
     // Helper to generate section html
     function renderGroup(title, list) {
       if (!list.length) return '';
-      let gHtml = '<div style="font-size: 11px; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: 0.8px; margin: 16px 0 8px; padding-left: 2px;">' + title + '</div>';
+      let gHtml = '<div style="font-size: 10px; font-weight: 700; color: #858585; text-transform: uppercase; letter-spacing: 0.8px; margin: 12px 0 6px; padding-left: 2px;">' + title + '</div>';
       list.forEach((s) => {
         const openClass = s.open ? ' open' : '';
-        const cardTheme = s.dark ? ' dark-card' : ' light-card';
-        gHtml += '<div class="report-section' + cardTheme + '">'
+        gHtml += '<div class="report-section">'
               + '<button class="section-toggle' + openClass + '">'
-              + '<span class="chevron">▶</span>'
+              + '<span class="chevron">▶</span> '
               + '<span>' + s.title + '</span>'
               + '</button>'
               + '<div class="section-content' + openClass + '">' + s.content + '</div>'
@@ -1552,12 +1829,11 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
 
     let html = '<div class="report-header">Session Development Notes</div>';
 
-    sections.forEach((s, i) => {
+    sections.forEach((s) => {
       const openClass = s.open ? ' open' : '';
-      const cardTheme = s.dark ? ' dark-card' : ' light-card';
-      html += '<div class="report-section' + cardTheme + '">'
-            + '<button class="section-toggle' + openClass + '" data-idx="' + i + '">'
-            + '<span class="chevron">▶</span>'
+      html += '<div class="report-section">'
+            + '<button class="section-toggle' + openClass + '">'
+            + '<span class="chevron">▶</span> '
             + '<span>' + s.title + '</span>'
             + '</button>'
             + '<div class="section-content' + openClass + '">' + s.content + '</div>'
@@ -1605,7 +1881,6 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
       const timeStr = formatTime(note.timestamp);
       const goalHtml = note.goal ? '<span class="history-item-goal" title="' + escapeHtml(note.goal) + '">🎯 ' + escapeHtml(note.goal) + '</span>' : '';
       
-      // Badges
       let badgesHtml = '';
       if (note.primary_language) {
         badgesHtml += '<span class="badge badge-lang">' + escapeHtml(note.primary_language) + '</span>';
@@ -1652,7 +1927,7 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
       const minutes = date.getMinutes();
       const ampm = hours >= 12 ? 'PM' : 'AM';
       hours = hours % 12;
-      hours = hours ? hours : 12; // the hour '0' should be '12'
+      hours = hours ? hours : 12;
       const minStr = minutes < 10 ? '0' + minutes : minutes;
       return hours + ':' + minStr + ' ' + ampm;
     } catch (e) {
@@ -1660,8 +1935,9 @@ export class OpenDocViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  // Load initial notes history
+  // Load initial notes history & workspace metadata
   vscode.postMessage({ command: 'refreshNotes' });
+  vscode.postMessage({ command: 'getWorkspaceMetadata' });
 })();
 </script>
 </body>
